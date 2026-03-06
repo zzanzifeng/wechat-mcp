@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Compiled binaries
+decrypt_wcdb
+*.dSYM/
+
+# Decrypted database output
+decrypted_dbs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
