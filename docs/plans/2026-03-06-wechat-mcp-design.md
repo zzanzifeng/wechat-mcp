@@ -240,6 +240,64 @@ def watch_wal_files(db_dir: str):
 
 延迟: WAL 轮询 30ms + 解密查询 ~70ms = **总延迟约 100ms**
 
+### 3.6 模糊群名匹配机制
+
+用户几乎不会输入精确群名，例如输入 "GPT-Runner" 实际群名可能是:
+- "GPT-Runner 技术交流群"
+- "GPT-Runner AI 讨论组"
+- "gpt runner 开发者群"
+
+#### 匹配策略
+
+```
+用户输入: "GPT-Runner"
+         │
+    ┌────▼──────────────────────────────┐
+    │  1. 从 group_new.db 加载所有群名     │
+    │  2. rapidfuzz 多维度匹配:           │
+    │     - fuzz.partial_ratio (子串)     │
+    │     - fuzz.token_sort_ratio (词序)  │
+    │     - fuzz.WRatio (加权综合)        │
+    │  3. 按综合分数排序                    │
+    └────┬──────────────────────────────┘
+         │
+    ┌────▼──────────────────────────────┐
+    │  匹配结果 (score ≥ 60):            │
+    │  ┌─────────────────────────────┐  │
+    │  │ 1. GPT-Runner 技术交流群  92分 │  │
+    │  │ 2. GPT-Runner AI 讨论组  85分 │  │
+    │  │ 3. Runner-GPT 开发群     65分 │  │
+    │  └─────────────────────────────┘  │
+    └────┬──────────────────────────────┘
+         │
+    ┌────▼──────────────────────────────┐
+    │  自动选择策略:                       │
+    │  - 最高分 ≥ 85 且领先第二名 ≥ 10分   │
+    │    → 自动选择最高分 ✓               │
+    │  - 否则 → 返回候选列表让 AI 决策     │
+    └───────────────────────────────────┘
+```
+
+#### 返回格式
+
+当无法自动确定时，返回候选列表供 Claude Code 选择:
+
+```json
+{
+  "status": "multiple_matches",
+  "query": "GPT-Runner",
+  "candidates": [
+    {"name": "GPT-Runner 技术交流群", "score": 92, "member_count": 156, "last_active": "2026-03-06 13:45"},
+    {"name": "GPT-Runner AI 讨论组", "score": 85, "member_count": 42, "last_active": "2026-03-05 20:10"}
+  ],
+  "hint": "请确认你要查看哪个群"
+}
+```
+
+Claude Code 收到候选列表后可以:
+1. 根据上下文自动选择最相关的 (如用户提到"交流群"就选第一个)
+2. 直接询问用户确认
+
 ---
 
 ## 4. MCP Tools Design
@@ -321,6 +379,52 @@ def watch_wal_files(db_dir: str):
   returns: 各会话的未读消息列表
 ```
 
+### 导出工具
+
+```yaml
+- name: wechat_export_md
+  description: 将群聊/对话消息导出为 Markdown 文档
+  params:
+    group_name: string     # 群名 (模糊匹配)
+    date: string           # 日期或日期范围 (YYYY-MM-DD 或 today/yesterday/this_week)
+    output_path: string    # 输出文件路径 (可选，默认 ./exports/<群名>_<日期>.md)
+    include_system: bool   # 是否包含系统消息 (默认 false)
+    include_media: bool    # 是否包含图片/视频/文件描述 (默认 true)
+  returns: 导出文件的绝对路径
+  example: |
+    用户: "把 GPT-Runner 交流群今天的消息导出为 md 文档"
+    调用: wechat_export_md(group_name="GPT-Runner", date="today")
+    输出: ./exports/GPT-Runner技术交流群_2026-03-06.md
+```
+
+导出的 Markdown 格式:
+
+```markdown
+# GPT-Runner 技术交流群 — 2026-03-06
+
+> 导出时间: 2026-03-06 14:30:00
+> 消息数量: 128 条 (文本 95, 链接 18, 图片 12, 其他 3)
+
+## 09:00 - 10:00
+
+**张三** (09:02):
+今天发现一个很好的 RAG 方案，分享给大家
+
+**李四** (09:05):
+什么方案？发出来看看
+
+**张三** (09:06):
+[链接] Building RAG with SQLite-vec - https://example.com/article
+
+**王五** (09:15):
+[图片] *(image_20260306_091500.jpg)*
+
+---
+
+## 10:00 - 11:00
+...
+```
+
 ### 管理工具
 
 ```yaml
@@ -386,6 +490,7 @@ wechat-mcp/
 │       ├── server.py           # MCP Server 入口 (fastmcp)
 │       ├── reader.py           # 核心读取层: 解密 + 查询
 │       ├── contacts.py         # 联系人/群聊解析和模糊匹配
+│       ├── exporter.py         # Markdown 导出 (群聊/对话 → .md 文件)
 │       ├── keys.py             # 密钥管理 (加载/验证/刷新)
 │       ├── watcher.py          # WAL 文件监控 (后台模式)
 │       └── types.py            # 数据类型定义
@@ -481,17 +586,18 @@ Claude Code:
 ### Phase 1: Core Reading (Week 1)
 - [ ] 集成 ylytdeng/wechat-decrypt 密钥提取器
 - [ ] 实现 `reader.py`: SQLCipher 解密 + 消息查询
-- [ ] 实现 `contacts.py`: 联系人/群聊模糊匹配
+- [ ] 实现 `contacts.py`: 联系人/群聊模糊匹配 (rapidfuzz 多维度 + 自动选择策略)
 - [ ] MCP Server: `wechat_read_group` + `wechat_read_chat` + `wechat_sessions`
 - [ ] `setup.sh` 一键初始化脚本
 
-### Phase 2: Search & Analysis (Week 2)
+### Phase 2: Search & Export (Week 2)
 - [ ] `wechat_search`: 跨聊天全局搜索
 - [ ] `wechat_contacts`: 联系人搜索
-- [ ] `wechat_extract_insights`: AI 价值内容提取
+- [ ] `wechat_export_md`: 导出群聊/对话为 Markdown 文档
 - [ ] `wechat_status`: 连接状态检查
 
-### Phase 3: Real-time Monitoring (Week 3)
+### Phase 3: Analysis & Monitoring (Week 3)
+- [ ] `wechat_extract_insights`: AI 价值内容提取
 - [ ] `watcher.py`: WAL 文件监控
 - [ ] `wechat_watch`: 后台监控指定群聊
 - [ ] `wechat_new_messages`: 新消息检测
